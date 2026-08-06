@@ -1,170 +1,199 @@
 import os
 import cv2
-import io
 import numpy as np
-from flask import Flask, render_template_string, request, redirect, url_for, flash, send_file
+from flask import Flask, request, jsonify
 from pymongo import MongoClient
 from bson.objectid import ObjectId
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "super_secret_fallback_key")
 
-# 1. MONGODB CONFIGURATION
-# Pulls connection string from Render env variables. Falls back to local machine if blank.
-mongo_url = os.environ.get('DATABASE_URL')
+# ==========================================
+# 🔌 MONGO DB CONNECTION SETUP
+# ==========================================
+# Fetches the connection string securely from Render's Environment panel
+MONGO_URI = os.getenv("MONGO_URI")
+client = MongoClient(MONGO_URI)
+db = client['unified_app_platform']
 
-if mongo_url:
-    # Connect to MongoDB Atlas Cloud
-    client = MongoClient(mongo_url)
-else:
-    # Fallback to local MongoDB instance for development testing
-    client = MongoClient('mongodb://localhost:27017/')
-
-# Define the database and collection names
-db = client['blog_db']
-posts_collection = db['posts']
+# Collection references
+blog_collection = db['blog_posts']
+cv_logs_collection = db['cv_match_logs']
 
 
-# 2. MONOLITHIC HTML TEMPLATE
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Multi-Service MongoDB App</title>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background: #f4f4f9; }
-        .card { background: white; padding: 20px; margin-bottom: 20px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-        h1 { color: #333; }
-        nav { margin-bottom: 20px; background: #fff; padding: 15px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); }
-        nav a { margin-right: 15px; text-decoration: none; color: #007BFF; font-weight: bold; }
-        nav a:hover { text-decoration: underline; }
-        label { display: block; margin-top: 10px; font-weight: bold; }
-        input[type="text"], input[type="file"], textarea { width: 100%; padding: 10px; margin-top: 5px; box-sizing: border-box; }
-        button { background: #007BFF; color: white; border: none; padding: 10px 15px; margin-top: 10px; cursor: pointer; border-radius: 3px; }
-        button:hover { background: #0056b3; }
-    </style>
-</head>
-<body>
-    <nav>
-        <a href="{{ url_for('home') }}">Blog Home</a>
-        <a href="{{ url_for('about') }}">About Me</a>
-        <a href="{{ url_for('cv_tool') }}">OpenCV Tool</a>
-        <a href="{{ url_for('admin') }}">Write Post</a>
-    </nav>
+# ==========================================
+# 🏠 SERVER HEALTH ROUTE
+# ==========================================
+@app.route('/', methods=['GET'])
+def health_check():
+    return jsonify({
+        "status": "Online",
+        "message": "Unified Blog & CV2 API Engine running successfully."
+    }), 200
 
-    {% with messages = get_flashed_messages() %}
-      {% if messages %}
-        {% for message in messages %}
-          <p style="color: green;"><b>{{ message }}</b></p>
-        {% endfor %}
-      {% endif %}
-    {% endwith %}
 
-    {% block content %}{% endblock %}
-</body>
-</html>
-"""
+# ==========================================
+# 📝 APP 1: BLOG ENGINE API ENDPOINTS
+# ==========================================
+@app.route('/api/blog', methods=['POST'])
+def create_blog_post():
+    """Creates a new blog article and inserts it into MongoDB."""
+    try:
+        data = request.json or {}
+        title = data.get("title")
+        content = data.get("content")
+        author = data.get("author", "Anonymous")
 
-# 3. ROUTE CONTROLLERS
+        if not title or not content:
+            return jsonify({"error": "Title and content fields are required"}), 400
 
-# Route A: Blog Feed (Fetches all documents from MongoDB sorted by newest first)
-@app.route('/')
-def home():
-    # MongoDB uses .find().sort('_id', -1) to achieve descending chronological order
-    posts = list(posts_collection.find().sort('_id', -1))
-    
-    home_html = HTML_TEMPLATE.replace('{% block content %}{% endblock %}', """
-        <h1>Latest Blog Updates (MongoDB)</h1>
-        {% if posts %}
-            {% for post in posts %}
-                <div class="card">
-                    <h2>{{ post.title }}</h2>
-                    <p>{{ post.content }}</p>
-                </div>
-            {% endfor %}
-        {% else %}
-            <div class="card"><p>No posts found. Use 'Write Post' to add content!</p></div>
-        {% endif %}
-    """)
-    return render_template_string(home_html, posts=posts)
+        post_document = {
+            "title": title,
+            "content": content,
+            "author": author,
+            "created_at": np.datetime64('now').astype(str)
+        }
 
-# Route B: Static About Page
-@app.route('/about')
-def about():
-    about_html = HTML_TEMPLATE.replace('{% block content %}{% endblock %}', """
-        <h1>About This Web Service</h1>
-        <div class="card">
-            <p>This is a unified application deployed to Render.</p>
-            <p>It dynamically switches roles between serving content out of a permanent MongoDB Atlas cloud cluster and executing matrix manipulations on uploaded images via OpenCV.</p>
-        </div>
-    """)
-    return render_template_string(about_html)
+        inserted_id = blog_collection.insert_one(post_document).inserted_id
+        return jsonify({"success": True, "post_id": str(inserted_id)}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-# Route C: The Admin Console (Inserts documents directly into MongoDB)
-@app.route('/admin', methods=['GET', 'POST'])
-def admin():
-    if request.method == 'POST':
-        title = request.form.get('title')
-        content = request.form.get('content')
+
+@app.route('/api/blog', methods=['GET'])
+def fetch_all_blog_posts():
+    """Retrieves all stored blog entries out of the database."""
+    try:
+        posts = list(blog_collection.find().sort("_id", -1))
+        for post in posts:
+            post["_id"] = str(post["_id"]) # Cast MongoDB ObjectId to JSON string
+        return jsonify(posts), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ==========================================
+# 👁️ APP 2: CV2 SHAPE MATCHING API ENDPOINT
+# ==========================================
+def extract_main_contour(grayscale_matrix):
+    """Binarizes an image buffer using Otsu's thresholding and extracts the main contour."""
+    _, thresh = cv2.threshold(grayscale_matrix, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    return max(contours, key=cv2.contourArea)
+
+
+@app.route('/api/cv/match-shape', methods=['POST'])
+def match_grayscale_shape():
+    """
+    Accepts a template image file and a target image file. 
+    Finds the shape via Hu Moments, draws contrast outlines, and logs coordinates to MongoDB.
+    """
+    try:
+        if 'template' not in request.files or 'target' not in request.files:
+            return jsonify({"error": "Please upload both 'template' and 'target' images"}), 400
+
+        # 1. Read files into RAM buffers
+        template_bytes = request.files['template'].read()
+        target_bytes = request.files['target'].read()
+
+        # 2. Decode files straight into 1-channel Grayscale matrices
+        np_temp = np.frombuffer(template_bytes, np.uint8)
+        np_targ = np.frombuffer(target_bytes, np.uint8)
+
+        img_template = cv2.imdecode(np_temp, cv2.IMREAD_GRAYSCALE)
+        img_target = cv2.imdecode(np_targ, cv2.IMREAD_GRAYSCALE)
+
+        if img_template is None or img_target is None:
+            return jsonify({"error": "Invalid image file format uploaded"}), 400
+
+        # 3. Separate structural outlines
+        template_contour = extract_main_contour(img_template)
         
-        if title and content:
-            # Create a dictionary payload to insert into NoSQL collection
-            new_post = {
-                "title": title,
-                "content": content
-            }
-            posts_collection.insert_one(new_post)
-            flash("Blog post written to MongoDB successfully!")
-            return redirect(url_for('home'))
+        _, target_thresh = cv2.threshold(img_target, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        target_contours, _ = cv2.findContours(target_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if template_contour is None or not target_contours:
+            return jsonify({"error": "Could not isolate enough prominent structural edges"}), 400
+
+        # 4. Search and score target image contents
+        best_match_contour = None
+        lowest_match_score = float('inf')
+
+        for contour in target_contours:
+            if cv2.contourArea(contour) < 40: # Ignore tiny visual artifacts/dust
+                continue
             
-    admin_html = HTML_TEMPLATE.replace('{% block content %}{% endblock %}', """
-        <h1>Write New Blog Entry</h1>
-        <form method="POST" class="card">
-            <label>Post Title</label>
-            <input type="text" name="title" required>
-            <label>Content</label>
-            <textarea name="content" rows="6" required></textarea>
-            <button type="submit">Publish</button>
-        </form>
-    """)
-    return render_template_string(admin_html)
+            # Compute Hu Moments structural delta score
+            score = cv2.matchShapes(template_contour, contour, cv2.CONTOURS_MATCH_I1, 0.0)
+            if score < lowest_match_score:
+                lowest_match_score = score
+                best_match_contour = contour
 
-# Route D: OpenCV User Interface Page
-@app.route('/cv-tool')
-def cv_tool():
-    cv_html = HTML_TEMPLATE.replace('{% block content %}{% endblock %}', """
-        <h1>OpenCV Image Processing Microservice</h1>
-        <div class="card">
-            <p>Upload any picture below. The application will convert the image into an uncompressed byte-array stream, apply a grayscale matrix transform using <b>cv2</b>, and download it instantly.</p>
-            <form action="{{ url_for('process_image') }}" method="POST" enctype="multipart/form-data">
-                <label>Select Image File:</label>
-                <input type="file" name="image" accept="image/*" required>
-                <button type="submit">Process & Download</button>
-            </form>
-        </div>
-    """)
-    return render_template_string(cv_html)
+        # 5. Evaluate results against standard structural margins (relaxed to 0.40)
+        match_found = False
+        box_coordinates = {}
+        log_id = None
 
-# Route E: OpenCV Processing Engine API Endpoint
-@app.route('/process-image', methods=['POST'])
-def process_image():
-    if 'image' not in request.files:
-        return "No image provided", 400
-    file = request.files['image']
-    
-    in_memory_file = io.BytesIO()
-    file.save(in_memory_file)
-    data = np.frombuffer(in_memory_file.getvalue(), dtype=np.uint8)
-    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        if lowest_match_score < 0.40 and best_match_contour is not None:
+            match_found = True
+            x, y, w, h = cv2.boundingRect(best_match_contour)
+            box_coordinates = {"x": x, "y": y, "width": w, "height": h}
 
-    if image is None:
-        return "Invalid file format", 400
+            # --- DUAL-CONTRAST GRAYSCALE DRAWING ENGINE ---
+            # Create working copy of target image grid array
+            canvas = img_target.copy()
+            
+            # Draw wide black outer boundary baseline box for light backgrounds
+            cv2.rectangle(canvas, (x-1, y-1), (x + w + 1, y + h + 1), 0, 6)
+            # Draw tight inner white box for dark backgrounds
+            cv2.rectangle(canvas, (x, y), (x + w, y + h), 255, 3)
 
-    processed_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    _, buffer = cv2.imencode('.jpg', processed_image)
-    
-    return send_file(io.BytesIO(buffer), mimetype='image/jpeg')
+            # Invert colors inside the bounding region to flag exactly what matched
+            roi = canvas[y:y+h, x:x+w]
+            canvas[y:y+h, x:x+w] = cv2.bitwise_not(roi)
 
+            # Text confirmation marker on the image array
+            cv2.putText(canvas, "MATCH", (x + 5, y + 22), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, 255, 2, cv2.LINE_AA)
+
+            # --- MONGO DB LOGGING TRIGGER ---
+            log_document = {
+                "match_success": True,
+                "score": lowest_match_score,
+                "bounding_box": box_coordinates,
+                "processed_at": np.datetime64('now').astype(str)
+            }
+            log_id = str(db['cv_match_logs'].insert_one(log_document).inserted_id)
+
+            # Convert our updated image array back to a binary string to return it
+            _, encoded_img = cv2.imencode('.jpg', canvas)
+            # You can process encoded_img if saving down to cloud blobs later
+
+        else:
+            # Log failed matches to database tracking for debugging analytics
+            log_document = {
+                "match_success": False,
+                "score": lowest_match_score,
+                "processed_at": np.datetime64('now').astype(str)
+            }
+            log_id = str(db['cv_match_logs'].insert_one(log_document).inserted_id)
+
+        return jsonify({
+            "match_found": match_found,
+            "score": lowest_match_score,
+            "coordinates": box_coordinates,
+            "database_log_id": log_id
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ==========================================
+# ⚙️ SYSTEM START RUNTIME
+# ==========================================
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    # Render maps dynamic ports inside routing headers dynamically at launch
+    app_port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=app_port)
