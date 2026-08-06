@@ -4,6 +4,7 @@ import numpy as np
 from flask import Flask, request, jsonify
 from pymongo import MongoClient
 from bson.objectid import ObjectId
+from flask import render_template_string # Ensure this is imported at the top!
 
 app = Flask(__name__)
 
@@ -23,12 +24,18 @@ cv_logs_collection = db['cv_match_logs']
 # ==========================================
 # 🏠 SERVER HEALTH ROUTE
 # ==========================================
+
+
 @app.route('/', methods=['GET'])
-def health_check():
-    return jsonify({
-        "status": "Online",
-        "message": "Unified Blog & CV2 API Engine running successfully."
-    }), 200
+def serve_home_interface():
+    """Loads the index.html from your root directory and serves it visually."""
+    try:
+        # Look for index.html right next to main.py
+        with open('index.html', 'r', encoding='utf-8') as file:
+            html_content = file.read()
+        return render_template_string(html_content)
+    except Exception as e:
+        return f"<h1>Backend is Live</h1><p>But index.html could not be read: {str(e)}</p>", 200
 
 
 # ==========================================
