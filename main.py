@@ -202,5 +202,5 @@ def match_grayscale_shape():
 # ==========================================
 if __name__ == '__main__':
     # Render maps dynamic ports inside routing headers dynamically at launch
-    app_port = int(os.environ.get("PORT", 5000))
+    app_port = int(os.environ.get("PORT", 5006))
     app.run(host='0.0.0.0', port=app_port)
