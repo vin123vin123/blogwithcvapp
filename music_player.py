@@ -104,17 +104,30 @@ async function exportMp3(name){
 }
 </script></body></html>"""
 
+_presets_checked = False
+
 
 @music_bp.route("/")
 def index():
-  for k, fn in PRESETS.items():
-    if not tracks_col.find_one({"name": k}, {"_id": 1}):
-      tracks_col.insert_one(
-          {"name": k, "audio_data": Binary(fn()), "type": "preset"}
-      )
-  return render_template_string(
-      HTML, tracks=list(tracks_col.find({}, {"name": 1, "type": 1, "_id": 0}))
-  )
+  global _presets_checked
+  # Fetch all track names & types in ONE single fast query
+  existing_docs = list(tracks_col.find({}, {"name": 1, "type": 1, "_id": 0}))
+
+  if not _presets_checked:
+    existing_names = {d["name"] for d in existing_docs}
+    missing = [
+        {"name": k, "audio_data": Binary(fn()), "type": "preset"}
+        for k, fn in PRESETS.items()
+        if k not in existing_names
+    ]
+    if missing:
+      tracks_col.insert_many(missing)
+      existing_docs = list(tracks_col.find({}, {"name": 1, "type": 1, "_id": 0}))
+    _presets_checked = True
+
+  return render_template_string(HTML, tracks=existing_docs)
+
+
 
 
 @music_bp.route("/stream/<name>")
