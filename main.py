@@ -5,13 +5,14 @@ from flask import Flask, request, jsonify
 from pymongo import MongoClient
 from bson.objectid import ObjectId
 from flask import render_template_string # Ensure this is imported at the top!
-from music_player import music_bp
 
-app.register_blueprint(music_bp)
 
 
 app = Flask(__name__)
 
+from music_player import music_bp
+
+app.register_blueprint(music_bp)
 # ==========================================
 # 🔌 MONGO DB CONNECTION SETUP
 # ==========================================
