@@ -47,6 +47,14 @@ def serve_home_interface():
             return render_template_string(f.read())
     except Exception as e:
         return f"<h1>Backend Live</h1><a href='/studio'>Open Music Studio</a><p>{e}</p>", 200
+@app.route('/hub', methods=['GET'])
+def serve_hub_page():
+    """Serves the new Cross-DB Blog & Visual Comparison dashboard on /hub."""
+    try:
+        with open('hub.html', 'r', encoding='utf-8') as f:
+            return render_template_string(f.read())
+    except Exception as e:
+        return f"<h1>Hub Error</h1><p>{e}</p>", 500
 
 
 # ==========================================
