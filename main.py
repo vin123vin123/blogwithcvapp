@@ -1,211 +1,216 @@
 import os
+import base64
+from datetime import datetime, timezone
 import cv2
 import numpy as np
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 from pymongo import MongoClient
-from bson.objectid import ObjectId
-from flask import render_template_string # Ensure this is imported at the top!
-
-
-
-app = Flask(__name__)
-
 from music_player import music_bp
 
+app = Flask(__name__)
 app.register_blueprint(music_bp)
-# ==========================================
-# 🔌 MONGO DB CONNECTION SETUP
-# ==========================================
-# Fetches the connection string securely from Render's Environment panel
-MONGO_URI = os.getenv("MONGO_URI")
-client = MongoClient(MONGO_URI)
-db = client['unified_app_platform']
 
-# Collection references
+# ==========================================
+# 🔌 MONGODB CONNECTION & 2-DAY TTL INDEXES
+# ==========================================
+MONGO_URI = os.getenv("MONGO_URI")
+client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+
+db = client['unified_app_platform']
 blog_collection = db['blog_posts']
 cv_logs_collection = db['cv_match_logs']
+images_collection = client['media_db']['images']  # Second DB for images
+
+# Auto-delete documents older than 2 days (172,800 seconds)
+TWO_DAYS = 172800
+blog_collection.create_index("expire_at", expireAfterSeconds=TWO_DAYS)
+cv_logs_collection.create_index("expire_at", expireAfterSeconds=TWO_DAYS)
+images_collection.create_index("expire_at", expireAfterSeconds=TWO_DAYS)
+
+
+def make_thumbnail_b64(img_matrix, max_width=180):
+    h, w = img_matrix.shape[:2]
+    if w > max_width:
+        scale = max_width / float(w)
+        img_matrix = cv2.resize(img_matrix, (max_width, int(h * scale)), interpolation=cv2.INTER_AREA)
+    _, buf = cv2.imencode('.jpg', img_matrix, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+    return base64.b64encode(buf).decode('utf-8')
 
 
 # ==========================================
-# 🏠 SERVER HEALTH ROUTE
+# 🏠 HOME INTERFACE
 # ==========================================
-
-
 @app.route('/', methods=['GET'])
 def serve_home_interface():
-    """Loads the index.html from your root directory and serves it visually."""
     try:
-        # Look for index.html right next to main.py
-        with open('index.html', 'r', encoding='utf-8') as file:
-            html_content = file.read()
-        return render_template_string(html_content)
+        with open('index.html', 'r', encoding='utf-8') as f:
+            return render_template_string(f.read())
     except Exception as e:
-        return f"<h1>Backend is Live</h1><p>But index.html could not be read: {str(e)}</p>", 200
+        return f"<h1>Backend Live</h1><a href='/studio'>Open Music Studio</a><p>{e}</p>", 200
 
 
 # ==========================================
-# 📝 APP 1: BLOG ENGINE API ENDPOINTS
+# 📝 BLOG API (WITH 2-DAY AUTO-DELETE)
 # ==========================================
 @app.route('/api/blog', methods=['POST'])
 def create_blog_post():
-    """Creates a new blog article and inserts it into MongoDB."""
     try:
         data = request.json or {}
-        title = data.get("title")
-        content = data.get("content")
-        author = data.get("author", "Anonymous")
-
+        title, content = data.get("title"), data.get("content")
         if not title or not content:
-            return jsonify({"error": "Title and content fields are required"}), 400
+            return jsonify({"error": "Title and content required"}), 400
 
-        post_document = {
+        now_utc = datetime.now(timezone.utc)
+        post_doc = {
             "title": title,
             "content": content,
-            "author": author,
-            "created_at": np.datetime64('now').astype(str)
+            "author": data.get("author", "Anonymous"),
+            "created_at": now_utc.strftime("%Y-%m-%d %H:%M UTC"),
+            "expire_at": now_utc
         }
-
-        inserted_id = blog_collection.insert_one(post_document).inserted_id
-        return jsonify({"success": True, "post_id": str(inserted_id)}), 201
+        res = blog_collection.insert_one(post_doc)
+        return jsonify({"success": True, "post_id": str(res.inserted_id)}), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/blog', methods=['GET'])
 def fetch_all_blog_posts():
-    """Retrieves all stored blog entries out of the database."""
     try:
-        posts = list(blog_collection.find().sort("_id", -1))
-        for post in posts:
-            post["_id"] = str(post["_id"]) # Cast MongoDB ObjectId to JSON string
+        posts = list(blog_collection.find({}, {"expire_at": 0}).sort("_id", -1))
+        for p in posts:
+            p["_id"] = str(p["_id"])
         return jsonify(posts), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 # ==========================================
-# 👁️ APP 2: CV2 SHAPE MATCHING API ENDPOINT
+# 👁️ CV2 SHAPE MATCHER + THUMBNAILS
 # ==========================================
-def extract_main_contour(grayscale_matrix):
-    """Binarizes an image buffer using Otsu's thresholding and extracts the main contour."""
-    _, thresh = cv2.threshold(grayscale_matrix, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+def extract_main_contour(gray):
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-    return max(contours, key=cv2.contourArea)
+    return max(contours, key=cv2.contourArea) if contours else None
 
 
 @app.route('/api/cv/match-shape', methods=['POST'])
 def match_grayscale_shape():
-    """
-    Accepts a template image file and a target image file. 
-    Finds the shape via Hu Moments, draws contrast outlines, and logs coordinates to MongoDB.
-    """
     try:
         if 'template' not in request.files or 'target' not in request.files:
-            return jsonify({"error": "Please upload both 'template' and 'target' images"}), 400
+            return jsonify({"error": "Upload both 'template' and 'target' images"}), 400
 
-        # 1. Read files into RAM buffers
-        template_bytes = request.files['template'].read()
-        target_bytes = request.files['target'].read()
+        img_temp = cv2.imdecode(np.frombuffer(request.files['template'].read(), np.uint8), cv2.IMREAD_GRAYSCALE)
+        img_targ = cv2.imdecode(np.frombuffer(request.files['target'].read(), np.uint8), cv2.IMREAD_GRAYSCALE)
+        if img_temp is None or img_targ is None:
+            return jsonify({"error": "Invalid image format"}), 400
 
-        # 2. Decode files straight into 1-channel Grayscale matrices
-        np_temp = np.frombuffer(template_bytes, np.uint8)
-        np_targ = np.frombuffer(target_bytes, np.uint8)
+        temp_contour = extract_main_contour(img_temp)
+        _, targ_thresh = cv2.threshold(img_targ, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        targ_contours, _ = cv2.findContours(targ_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if temp_contour is None or not targ_contours:
+            return jsonify({"error": "No prominent structural edges found"}), 400
 
-        img_template = cv2.imdecode(np_temp, cv2.IMREAD_GRAYSCALE)
-        img_target = cv2.imdecode(np_targ, cv2.IMREAD_GRAYSCALE)
+        best_contour, lowest_score = None, float('inf')
+        for c in targ_contours:
+            if cv2.contourArea(c) >= 40:
+                score = cv2.matchShapes(temp_contour, c, cv2.CONTOURS_MATCH_I1, 0.0)
+                if score < lowest_score:
+                    lowest_score, best_contour = score, c
 
-        if img_template is None or img_target is None:
-            return jsonify({"error": "Invalid image file format uploaded"}), 400
+        now_utc = datetime.now(timezone.utc)
+        temp_thumb = make_thumbnail_b64(img_temp)
+        match_found = lowest_score < 0.40 and best_contour is not None
+        box = {}
 
-        # 3. Separate structural outlines
-        template_contour = extract_main_contour(img_template)
-        
-        _, target_thresh = cv2.threshold(img_target, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        target_contours, _ = cv2.findContours(target_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        if template_contour is None or not target_contours:
-            return jsonify({"error": "Could not isolate enough prominent structural edges"}), 400
-
-        # 4. Search and score target image contents
-        best_match_contour = None
-        lowest_match_score = float('inf')
-
-        for contour in target_contours:
-            if cv2.contourArea(contour) < 40: # Ignore tiny visual artifacts/dust
-                continue
-            
-            # Compute Hu Moments structural delta score
-            score = cv2.matchShapes(template_contour, contour, cv2.CONTOURS_MATCH_I1, 0.0)
-            if score < lowest_match_score:
-                lowest_match_score = score
-                best_match_contour = contour
-
-        # 5. Evaluate results against standard structural margins (relaxed to 0.40)
-        match_found = False
-        box_coordinates = {}
-        log_id = None
-
-        if lowest_match_score < 0.40 and best_match_contour is not None:
-            match_found = True
-            x, y, w, h = cv2.boundingRect(best_match_contour)
-            box_coordinates = {"x": x, "y": y, "width": w, "height": h}
-
-            # --- DUAL-CONTRAST GRAYSCALE DRAWING ENGINE ---
-            # Create working copy of target image grid array
-            canvas = img_target.copy()
-            
-            # Draw wide black outer boundary baseline box for light backgrounds
-            cv2.rectangle(canvas, (x-1, y-1), (x + w + 1, y + h + 1), 0, 6)
-            # Draw tight inner white box for dark backgrounds
+        if match_found:
+            x, y, w, h = cv2.boundingRect(best_contour)
+            box = {"x": x, "y": y, "width": w, "height": h}
+            canvas = img_targ.copy()
+            cv2.rectangle(canvas, (x - 1, y - 1), (x + w + 1, y + h + 1), 0, 6)
             cv2.rectangle(canvas, (x, y), (x + w, y + h), 255, 3)
-
-            # Invert colors inside the bounding region to flag exactly what matched
-            roi = canvas[y:y+h, x:x+w]
-            canvas[y:y+h, x:x+w] = cv2.bitwise_not(roi)
-
-            # Text confirmation marker on the image array
-            cv2.putText(canvas, "MATCH", (x + 5, y + 22), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, 255, 2, cv2.LINE_AA)
-
-            # --- MONGO DB LOGGING TRIGGER ---
-            log_document = {
-                "match_success": True,
-                "score": lowest_match_score,
-                "bounding_box": box_coordinates,
-                "processed_at": np.datetime64('now').astype(str)
-            }
-            log_id = str(db['cv_match_logs'].insert_one(log_document).inserted_id)
-
-            # Convert our updated image array back to a binary string to return it
-            _, encoded_img = cv2.imencode('.jpg', canvas)
-            # You can process encoded_img if saving down to cloud blobs later
-
+            canvas[y:y+h, x:x+w] = cv2.bitwise_not(canvas[y:y+h, x:x+w])
+            cv2.putText(canvas, "MATCH", (x + 5, y + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, 255, 2, cv2.LINE_AA)
+            res_thumb = make_thumbnail_b64(canvas)
         else:
-            # Log failed matches to database tracking for debugging analytics
-            log_document = {
-                "match_success": False,
-                "score": lowest_match_score,
-                "processed_at": np.datetime64('now').astype(str)
-            }
-            log_id = str(db['cv_match_logs'].insert_one(log_document).inserted_id)
+            res_thumb = make_thumbnail_b64(img_targ)
+
+        log_doc = {
+            "match_success": match_found,
+            "score": lowest_score if lowest_score != float('inf') else 999.0,
+            "bounding_box": box,
+            "template_thumb": temp_thumb,
+            "result_thumb": res_thumb,
+            "processed_at": now_utc.strftime("%Y-%m-%d %H:%M UTC"),
+            "expire_at": now_utc
+        }
+        log_id = str(cv_logs_collection.insert_one(log_doc).inserted_id)
 
         return jsonify({
             "match_found": match_found,
-            "score": lowest_match_score,
-            "coordinates": box_coordinates,
+            "score": log_doc["score"],
+            "coordinates": box,
             "database_log_id": log_id
         }), 200
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 # ==========================================
-# ⚙️ SYSTEM START RUNTIME
+# 📊 CROSS-DB JOIN & COMPARISON SUMMARY
 # ==========================================
+@app.route('/api/dashboard-summary', methods=['GET'])
+def get_cross_db_summary():
+    try:
+        posts = list(blog_collection.find({}, {"expire_at": 0}).sort("_id", -1))
+        imgs = list(images_collection.find({}, {"_id": 0, "expire_at": 0}))
+        img_map = {i.get("title"): i for i in imgs if i.get("title")}
+
+        joined, matched_blogs = [], 0
+        for p in posts:
+            pid = str(p["_id"])
+            img = img_map.get(p.get("title")) or img_map.get(pid)
+            if img:
+                matched_blogs += 1
+            joined.append({
+                "id": pid,
+                "title": p.get("title", "Untitled"),
+                "author": p.get("author", "Anonymous"),
+                "content": p.get("content", ""),
+                "created_at": p.get("created_at", ""),
+                "image": img
+            })
+
+        logs = list(cv_logs_collection.find({}, {"expire_at": 0}).sort("_id", -1).limit(30))
+        total_cv = len(logs)
+        hits = sum(1 for l in logs if l.get("match_success"))
+        scores = [l["score"] for l in logs if isinstance(l.get("score"), (int, float)) and l["score"] < 900]
+
+        return jsonify({
+            "summary": {
+                "total_blogs": len(posts),
+                "blogs_with_images": matched_blogs,
+                "total_cv_comparisons": total_cv,
+                "cv_matches_found": hits,
+                "cv_match_rate": f"{round((hits / total_cv) * 100, 1)}%" if total_cv else "0%",
+                "avg_hu_score": round(sum(scores) / len(scores), 4) if scores else 0
+            },
+            "items": joined,
+            "recent_comparisons": [
+                {
+                    "success": l.get("match_success", False),
+                    "score": round(l["score"], 4) if isinstance(l.get("score"), (int, float)) and l["score"] < 900 else "N/A",
+                    "box": l.get("bounding_box", {}),
+                    "template_thumb": l.get("template_thumb", ""),
+                    "result_thumb": l.get("result_thumb", ""),
+                    "time": l.get("processed_at", "")
+                }
+                for l in logs[:6]
+            ]
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == '__main__':
-    # Render maps dynamic ports inside routing headers dynamically at launch
-    app_port = int(os.environ.get("PORT", 11000))
-    app.run(host='0.0.0.0', port=app_port)
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 11000)))
