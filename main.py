@@ -43,7 +43,7 @@ def make_thumbnail_b64(img_matrix, max_width=180):
 @app.route('/', methods=['GET'])
 def serve_home_interface():
     try:
-        with open('index1.html', 'r', encoding='utf-8') as f:
+        with open('Index1.html', 'r', encoding='utf-8') as f:
             return render_template_string(f.read())
     except Exception as e:
         return f"<h1>Backend Live</h1><a href='/studio'>Open Music Studio</a><p>{e}</p>", 200
