@@ -1,1 +1,150 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Unified App Platform</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #121212; color: #eee; max-width: 650px; margin: auto; padding: 14px; }
+    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+    .btn-studio { background: #1db954; color: #000; padding: 8px 14px; border-radius: 6px; text-decoration: none; font-weight: bold; font-size: 13px; }
+    .card { background: #1e1e1e; padding: 14px; border-radius: 10px; margin-bottom: 14px; }
+    input, textarea { width: 100%; box-sizing: border-box; padding: 8px; margin: 6px 0 10px; border-radius: 6px; border: 1px solid #333; background: #262626; color: #fff; }
+    button { background: #1db954; color: #000; border: none; padding: 8px 14px; border-radius: 6px; font-weight: bold; cursor: pointer; }
+    .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-bottom: 14px; }
+    .stat-box { background: #1e1e1e; padding: 10px; border-radius: 8px; }
+    .thumb-row { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
+    .thumb-box { flex: 1; text-align: center; background: #111; padding: 6px; border-radius: 6px; }
+    .thumb-box img { max-width: 100%; max-height: 110px; border-radius: 4px; }
+    small { color: #999; }
+  </style>
+</head>
+<body>
 
+  <div class="header">
+    <h3 style="margin:0; color:#1db954;">Unified Studio & CV Hub</h3>
+    <a href="/studio" class="btn-studio">🎵 Music Studio</a>
+  </div>
+
+  <!-- 1. SUMMARY METRICS -->
+  <div id="summary-bar" class="grid-2"></div>
+
+  <!-- 2. BLOG POST FORM -->
+  <div class="card">
+    <strong>📝 New Blog Post (2-Day Auto-Expire)</strong>
+    <input type="text" id="b-title" placeholder="Post title (matches image title if any)">
+    <input type="text" id="b-author" placeholder="Author name">
+    <textarea id="b-content" rows="3" placeholder="Write content..."></textarea>
+    <button onclick="submitBlog()">Publish Post</button>
+  </div>
+
+  <!-- 3. CV2 SHAPE COMPARISON FORM -->
+  <div class="card">
+    <strong>👁️ Compare Shapes (Template vs Target)</strong>
+    <div style="margin-top:8px;">
+      <small>Template Image:</small><input type="file" id="cv-temp" accept="image/*">
+      <small>Target Image:</small><input type="file" id="cv-targ" accept="image/*">
+    </div>
+    <button onclick="runCvMatch()">Run Comparison</button>
+    <span id="cv-status" style="font-size:12px; margin-left:8px; color:#ff9800;"></span>
+  </div>
+
+  <!-- 4. SIDE-BY-SIDE VISUAL COMPARISON SUMMARY -->
+  <div id="cv-summary-list"></div>
+
+  <!-- 5. CROSS-DB JOINED BLOGS + IMAGES FEED -->
+  <div id="joined-feed">Loading dashboard...</div>
+
+<script>
+async function submitBlog() {
+  const title = document.getElementById("b-title").value.trim();
+  const content = document.getElementById("b-content").value.trim();
+  const author = document.getElementById("b-author").value.trim() || "Anonymous";
+  if (!title || !content) return alert("Enter title and content");
+
+  const res = await fetch("/api/blog", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title, content, author })
+  });
+  if (res.ok) {
+    document.getElementById("b-title").value = "";
+    document.getElementById("b-content").value = "";
+    loadDashboard();
+  }
+}
+
+async function runCvMatch() {
+  const temp = document.getElementById("cv-temp").files[0];
+  const targ = document.getElementById("cv-targ").files[0];
+  if (!temp || !targ) return alert("Select both Template and Target images");
+
+  const status = document.getElementById("cv-status");
+  status.innerText = "Processing...";
+  const fd = new FormData();
+  fd.append("template", temp);
+  fd.append("target", targ);
+
+  const res = await fetch("/api/cv/match-shape", { method: "POST", body: fd });
+  const data = await res.json();
+  status.innerText = res.ok ? (data.match_found ? "✅ Match Found!" : "❌ No Match") : "Error";
+  if (res.ok) loadDashboard();
+}
+
+async function loadDashboard() {
+  try {
+    const res = await fetch("/api/dashboard-summary");
+    const data = await res.json();
+    const s = data.summary;
+
+    document.getElementById("summary-bar").innerHTML = `
+      <div class="stat-box">
+        <small>Joined Blogs / Images</small><br>
+        <strong style="font-size:18px; color:#1db954;">${s.blogs_with_images} / ${s.total_blogs}</strong>
+      </div>
+      <div class="stat-box">
+        <small>CV Match Rate (Avg Hu)</small><br>
+        <strong style="font-size:18px; color:#ff9800;">${s.cv_match_rate} (${s.avg_hu_score})</strong>
+      </div>`;
+
+    document.getElementById("cv-summary-list").innerHTML =
+      `<h4>Visual Comparisons (${s.cv_matches_found}/${s.total_cv_comparisons} Matched)</h4>` +
+      data.recent_comparisons.map(c => `
+        <div class="card" style="border-left:4px solid ${c.success ? '#1db954' : '#ff5252'};">
+          <div style="display:flex; justify-content:space-between; font-size:13px;">
+            <strong>${c.success ? "✅ SHAPE MATCHED" : "❌ NO MATCH"}</strong>
+            <span>Score: <b>${c.score}</b></span>
+          </div>
+          <small>${c.time}</small>
+          ${(c.template_thumb && c.result_thumb) ? `
+          <div class="thumb-row">
+            <div class="thumb-box"><small>Template</small><br><img src="data:image/jpeg;base64,${c.template_thumb}"></div>
+            <div>➔</div>
+            <div class="thumb-box"><small>Target Result</small><br><img src="data:image/jpeg;base64,${c.result_thumb}"></div>
+          </div>` : ""}
+        </div>`).join("");
+
+    document.getElementById("joined-feed").innerHTML = `<h4>Joined Feed</h4>` +
+      data.items.map(item => {
+        let imgHtml = "";
+        if (item.image) {
+          const src = item.image.url || item.image.image_url ||
+                      (item.image.image_data ? `data:image/jpeg;base64,${item.image.image_data}` : "");
+          if (src) imgHtml = `<img src="${src}" style="max-width:100%; border-radius:6px; margin-top:8px;">`;
+        }
+        return `
+          <div class="card">
+            <strong style="font-size:16px;">${item.title}</strong><br>
+            <small>By ${item.author} • ${item.created_at}</small>
+            <p style="margin:8px 0 0;">${item.content}</p>
+            ${imgHtml}
+          </div>`;
+      }).join("");
+  } catch (e) {
+    document.getElementById("joined-feed").innerHTML = "<p style='color:#ff5252;'>Failed to load dashboard.</p>";
+  }
+}
+
+loadDashboard();
+</script>
+</body>
+</html>
